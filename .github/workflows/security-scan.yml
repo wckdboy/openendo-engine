@@ -22,5 +22,5 @@ jobs:
           fi
       - name: Python syntax + tests
         run: |
-          pip install --quiet -r requirements.txt
+          pip install --quiet -r requirements.txt pytest
           python -m pytest -q
