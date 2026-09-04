@@ -16,7 +16,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: PII scan (personal identifiers)
         run: |
-          if git grep -nEi 'dearwolf|wmd@|nkp@|blxmp\.dk|hermeswebui|lsv2_pt_[a-f0-9]+' -- . ':!.gitignore'; then
+          if git grep -nEi 'dearwolf|wmd@|nkp@|blxmp\.dk|hermeswebui|lsv2_pt_[a-f0-9]+' -- . ':!.gitignore' ':!.github'; then
             echo "::error::Personal identifiers or live API keys found in the public repo — remove them before merging."
             exit 1
           fi
