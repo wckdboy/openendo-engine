@@ -1,0 +1,26 @@
+name: security-scan
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: gitleaks (secrets & credentials)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: PII scan (personal identifiers)
+        run: |
+          if git grep -nEi 'dearwolf|wmd@|nkp@|blxmp\.dk|hermeswebui|lsv2_pt_[a-f0-9]+' -- . ':!.gitignore'; then
+            echo "::error::Personal identifiers or live API keys found in the public repo — remove them before merging."
+            exit 1
+          fi
+      - name: Python syntax + tests
+        run: |
+          pip install --quiet -r requirements.txt
+          python -m pytest -q
