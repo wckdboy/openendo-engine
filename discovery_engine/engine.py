@@ -12,7 +12,7 @@ from datetime import date, datetime, timezone
 from langsmith import traceable
 
 from . import data as d
-from .config import Settings
+from .config import CATEGORIES, ENGINE_VERSION, FINDINGS_SCHEMA, Settings
 from .tracing import traced_client
 from .validation import validate_finding
 
@@ -106,8 +106,48 @@ def _default_url(kind: str, sid: str) -> str:
     return sid or ""
 
 
-def _gen_id(run_date: date, category: str, i: int) -> str:
+def gen_finding_id(run_date: date, category: str, i: int) -> str:
+    """Stable finding id: OE-YYYY-MM-DD-CATE-0001."""
     return f"OE-{run_date.isoformat()}-{category[:4].upper()}-{i:04d}"
+
+
+def empty_stage_reports() -> list[dict]:
+    """Schema-valid empty stages for dry-run / fixture mode."""
+    return [{"category": category, "findings": [], "dropped": []} for category in CATEGORIES]
+
+
+def assemble_result(
+    s: Settings,
+    stage_reports: list[dict],
+    *,
+    warnings: list[str] | None = None,
+    dry_run: bool = False,
+    run_date: date | None = None,
+) -> dict:
+    """Build the findings document. Always includes a warnings list."""
+    run_date = run_date or date.today()
+    now = datetime.now(timezone.utc).isoformat()
+    all_findings = []
+    for report in stage_reports:
+        for i, finding in enumerate(report["findings"]):
+            tagged = dict(finding)
+            tagged["id"] = gen_finding_id(run_date, report["category"], i + 1)
+            all_findings.append(tagged)
+    result = {
+        "schema": FINDINGS_SCHEMA,
+        "run_date": run_date.isoformat(),
+        "generated_at": now,
+        "engine_version": ENGINE_VERSION,
+        "model": "dry-run" if dry_run else s.model,
+        "langsmith_project": s.langsmith_project,
+        "source": "dry-run" if dry_run and s.source == "raw" else s.source,
+        "dry_run": dry_run,
+        "counts": {report["category"]: len(report["findings"]) for report in stage_reports},
+        "dropped": [item for report in stage_reports for item in report["dropped"]],
+        "warnings": list(warnings or []),
+        "findings": all_findings,
+    }
+    return result
 
 
 @traceable(name="discovery_research_gaps", run_type="chain")
@@ -180,36 +220,35 @@ def stage_hypotheses(s, client, corpus: d.Corpus) -> dict:
     )
 
 
-@traceable(name="discovery_run", run_type="chain")
-def run_discovery(s: Settings) -> dict:
-    """Full engine run: four traced stages -> tagged findings report."""
-    client = traced_client(s)
-    corpus = d.load_corpus(s.source, s.local_path)
-    run_date = date.today()
-    now = datetime.now(timezone.utc).isoformat()
+def _load_run_corpus(s: Settings, *, dry_run: bool) -> d.Corpus:
+    """Load the data layer. Dry-run never touches the network."""
+    if dry_run and s.source == "raw":
+        corpus = d.Corpus()
+        corpus.warn("dry-run: skipped remote corpus fetch (no network)")
+        d.collect_whitelist(corpus)
+        return corpus
+    return d.load_corpus(s.source, s.local_path)
 
+
+@traceable(name="discovery_run", run_type="chain")
+def run_discovery(s: Settings, *, dry_run: bool = False) -> dict:
+    """Full engine run: four traced stages -> tagged findings report.
+
+    dry_run skips the LLM and (for source=raw) remote fetches, then writes a
+    schema-valid skeleton with empty findings. Local --source still loads
+    fixtures so CI can exercise the loader without inventing claims.
+    """
+    corpus = _load_run_corpus(s, dry_run=dry_run)
+    warnings = list(corpus.warnings)
+    if dry_run:
+        warnings.append("dry-run: LLM stages skipped; skeleton findings only")
+        return assemble_result(s, empty_stage_reports(), warnings=warnings, dry_run=True)
+
+    client = traced_client(s)
     stage_reports = [
         stage_research_gaps(s, client, corpus),
         stage_conflicts(s, client, corpus),
         stage_repurposing_leads(s, client, corpus),
         stage_hypotheses(s, client, corpus),
     ]
-
-    all_findings = []
-    for rep in stage_reports:
-        for i, f in enumerate(rep["findings"]):
-            f["id"] = _gen_id(run_date, rep["category"], i + 1)
-            all_findings.append(f)
-
-    return {
-        "schema": "openendo-discovery-findings-v1",
-        "run_date": run_date.isoformat(),
-        "generated_at": now,
-        "engine_version": "0.1.0",
-        "model": s.model,
-        "langsmith_project": s.langsmith_project,
-        "source": s.source,
-        "counts": {r["category"]: len(r["findings"]) for r in stage_reports},
-        "dropped": [x for r in stage_reports for x in r["dropped"]],
-        "findings": all_findings,
-    }
+    return assemble_result(s, stage_reports, warnings=warnings, dry_run=False)

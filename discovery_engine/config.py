@@ -29,10 +29,14 @@ def _load_dotenv() -> None:
 
 _load_dotenv()
 
+ENGINE_VERSION = "0.1.1"
+FINDINGS_SCHEMA = "openendo-discovery-findings-v1"
 CLASSIFICATIONS = ("documented-evidence", "likely-association", "untested-hypothesis")
 CONFIDENCES = ("high", "medium", "low")
 CATEGORIES = ("research_gap", "conflict", "repurposing_lead", "hypothesis")
 RAW_BASE = "https://raw.githubusercontent.com/wckdboy/openendo/main"
+FETCH_TIMEOUT_SEC = 45
+USER_AGENT = f"openendo-discovery-engine/{ENGINE_VERSION}"
 
 
 @dataclass
