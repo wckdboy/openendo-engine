@@ -7,6 +7,9 @@ from __future__ import annotations
 
 import os
 
+from langsmith.wrappers import wrap_openai
+from openai import OpenAI
+
 from .config import Settings
 
 
@@ -21,9 +24,6 @@ def apply_tracing_env(s: Settings) -> None:
 
 def traced_client(s: Settings):
     """OpenAI-compatible client wrapped for auto-tracing."""
-    from langsmith.wrappers import wrap_openai
-    from openai import OpenAI
-
     kwargs = {
         "base_url": s.openai_base_url,
         "api_key": s.openai_api_key or "missing",

@@ -1,0 +1,32 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: pip install --upgrade pip && pip install -r requirements.txt pytest
+      - name: Unit tests
+        run: python -m pytest -q
+      - name: Dry-run pipeline
+        run: |
+          python -m discovery_engine run --dry-run --outdir /tmp/openendo-dry-run
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          days = sorted(Path("/tmp/openendo-dry-run").iterdir())
+          assert days, "dry-run wrote no output directory"
+          payload = json.loads((days[-1] / "findings.json").read_text())
+          assert payload["schema"] == "openendo-discovery-findings-v1"
+          assert payload["dry_run"] is True
+          assert payload["findings"] == []
+          assert (days[-1] / "report.md").is_file()
+          print("dry-run ok:", days[-1])
+          PY

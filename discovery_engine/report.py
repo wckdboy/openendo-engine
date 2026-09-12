@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from collections import Counter
 from pathlib import Path
 
-from .engine import run_discovery
 from .config import Settings
+from .engine import run_discovery
+from .tracing import apply_tracing_env
 
 CONF_ORDER = {"documented-evidence": 0, "likely-association": 1, "untested-hypothesis": 2}
 
@@ -24,8 +25,6 @@ def write_reports(result: dict, outdir: Path) -> dict:
 
 
 def render_markdown(result: dict) -> str:
-    from collections import Counter
-
     counts = Counter(f["category"] for f in result["findings"])
     lines = [
         f"# OpenEndo Discovery Engine — {result['run_date']}",
@@ -44,7 +43,17 @@ def render_markdown(result: dict) -> str:
         lines.append(f"- {cat}: {counts.get(cat, 0)} findings")
     if result.get("dropped"):
         lines.append(f"- dropped (failed validation): {len(result['dropped'])}")
+    if result.get("dry_run"):
+        lines.append("- mode: dry-run (LLM skipped; skeleton findings)")
+    if result.get("warnings"):
+        lines.append(f"- warnings: {len(result['warnings'])}")
     lines.append("")
+
+    if result.get("warnings"):
+        lines += ["## Warnings", ""]
+        for warning in result["warnings"]:
+            lines.append(f"- {warning}")
+        lines.append("")
 
     findings = sorted(result["findings"], key=lambda f: (CONF_ORDER.get(f["classification"], 9), f["id"]))
     for f in findings:
@@ -70,14 +79,18 @@ def render_markdown(result: dict) -> str:
     return "\n".join(lines)
 
 
-def run(s: Settings, outdir: Path) -> None:
-    if not s.tracing_enabled():
+def run(s: Settings, outdir: Path, *, dry_run: bool = False) -> dict:
+    if dry_run:
+        print("Dry-run: skipping LLM and remote fetch.")
+    elif not s.tracing_enabled():
         print("WARN: LANGSMITH_API_KEY not set — running WITHOUT tracing.")
-    from .tracing import apply_tracing_env
-
     apply_tracing_env(s)
-    result = run_discovery(s)
+    result = run_discovery(s, dry_run=dry_run)
     paths = write_reports(result, outdir)
-    print(f"Findings: {result['counts']} — dropped: {len(result.get('dropped', []))}")
+    warnings = result.get("warnings") or []
+    print(f"Findings: {result['counts']} — dropped: {len(result.get('dropped', []))} — warnings: {len(warnings)}")
+    for warning in warnings:
+        print(f"WARN: {warning}")
     print(f"JSON: {paths['json']}")
     print(f"Markdown: {paths['md']}")
+    return result

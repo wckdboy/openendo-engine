@@ -4,4 +4,6 @@ Every claim is classified documented-evidence|likely-association|untested-hypoth
 and source-traced. Research support only — never medical advice.
 """
 
-__version__ = "0.1.0"
+from .config import ENGINE_VERSION
+
+__version__ = ENGINE_VERSION
