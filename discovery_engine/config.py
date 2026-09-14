@@ -29,7 +29,7 @@ def _load_dotenv() -> None:
 
 _load_dotenv()
 
-ENGINE_VERSION = "0.1.1"
+ENGINE_VERSION = "0.1.2"
 FINDINGS_SCHEMA = "openendo-discovery-findings-v1"
 CLASSIFICATIONS = ("documented-evidence", "likely-association", "untested-hypothesis")
 CONFIDENCES = ("high", "medium", "low")
@@ -37,6 +37,11 @@ CATEGORIES = ("research_gap", "conflict", "repurposing_lead", "hypothesis")
 RAW_BASE = "https://raw.githubusercontent.com/wckdboy/openendo/main"
 FETCH_TIMEOUT_SEC = 45
 USER_AGENT = f"openendo-discovery-engine/{ENGINE_VERSION}"
+
+# Live default: DeepSeek direct (OpenAI-compatible). Swap BASE_URL + model to
+# use OpenAI, OpenRouter, OrcaRouter, or any other /v1-compatible endpoint.
+DEFAULT_OPENAI_BASE_URL = "https://api.deepseek.com"
+DEFAULT_DISCOVERY_MODEL = "deepseek-flash"
 
 
 @dataclass
@@ -51,13 +56,13 @@ class Settings:
     langsmith_project: str = field(
         default_factory=lambda: os.environ.get("LANGSMITH_PROJECT", "openendo-discovery-engine")
     )
-    # LLM (OpenAI-compatible)
+    # LLM (OpenAI-compatible). Default is DeepSeek direct, not a router.
     openai_base_url: str = field(
-        default_factory=lambda: os.environ.get("OPENAI_BASE_URL", "https://api.orcarouter.ai/v1")
+        default_factory=lambda: os.environ.get("OPENAI_BASE_URL", DEFAULT_OPENAI_BASE_URL)
     )
     openai_api_key: str = field(default_factory=lambda: os.environ.get("OPENAI_API_KEY", ""))
     model: str = field(
-        default_factory=lambda: os.environ.get("DISCOVERY_MODEL", "deepseek/deepseek-v4-flash-0731")
+        default_factory=lambda: os.environ.get("DISCOVERY_MODEL", DEFAULT_DISCOVERY_MODEL)
     )
     temperature: float = field(default_factory=lambda: float(os.environ.get("DISCOVERY_TEMPERATURE", "0.2")))
     # Data source

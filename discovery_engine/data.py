@@ -184,6 +184,11 @@ def collect_whitelist(corpus: Corpus) -> None:
         for c in entries.get("candidates", []):
             if c.get("molecule"):
                 allowed["chembl"].add(c["molecule"])
+    for c in corpus.repurposing.get("candidates") or []:
+        if c.get("molecule"):
+            allowed["chembl"].add(c["molecule"])
+        if c.get("target_chembl"):
+            allowed["chembl"].add(c["target_chembl"])
     for trial_list in (corpus.trials.get("trials", []), corpus.trials_dk.get("trials", [])):
         for t in trial_list:
             if t.get("nct_id"):
@@ -246,28 +251,133 @@ def load_corpus(
     return corpus
 
 
+MAX_PHASE_NOTE = (
+    "NOTE: max_phase is ChEMBL's highest development phase for ANY indication "
+    "— not endometriosis-specific. Do not treat it as endometriosis approval "
+    "or trial status."
+)
+
+TITLE_ONLY_NOTE = (
+    "NOTE: these paper rows are TITLE-ONLY (no abstracts in this corpus). "
+    "Do not infer mechanism, direction of effect, sample size, or study "
+    "results from a title. If a finding rests only on a title, classify "
+    "untested-hypothesis (or low confidence) and say so in caveats. "
+    "Prefer not inventing a mechanism from a title alone."
+)
+
+
 def compact_targets(corpus: Corpus, limit: int = 60) -> str:
     """One line per target: gene, CHEMBL, name, mechanisms, max_phase, novel."""
     rows = []
     for t in corpus.targets.get("targets", [])[:limit]:
         rows.append(
             f"- {t.get('gene')} ({t.get('chembl_id')}) {t.get('name')} — "
-            f"mechanisms={t.get('mechanisms')}, max_phase={t.get('max_phase')}, novel={t.get('novel')}"
+            f"mechanisms={t.get('mechanisms')}, "
+            f"max_phase={t.get('max_phase')} (ChEMBL any-indication), "
+            f"novel={t.get('novel')}"
         )
-    return "\n".join(rows) or "(no target data)"
+    if not rows:
+        return "(no target data)"
+    return MAX_PHASE_NOTE + "\n" + "\n".join(rows)
+
+
+def _display_name(candidate: dict) -> str:
+    """Prefer a human-readable name over a raw ChEMBL identifier."""
+    mol = str(candidate.get("molecule") or "").strip()
+    name = str(candidate.get("name") or "").strip()
+    if name and name != mol:
+        return name
+    return name or mol or "(unnamed)"
+
+
+def _format_named_candidate(c: dict) -> str:
+    status = c.get("status")
+    detail = str(c.get("status_detail") or "").strip()
+    status_bit = f", status={status}" if status else ""
+    detail_bit = f" — {detail}" if detail else ""
+    return (
+        f"- {_display_name(c)} ({c.get('molecule')}) → "
+        f"{c.get('target')} ({c.get('target_chembl')}): "
+        f"pChEMBL {c.get('pchembl')}, phase {c.get('phase')}"
+        f"{status_bit}{detail_bit}"
+    )
 
 
 def compact_repurposing(corpus: Corpus) -> str:
-    d = corpus.repurposing
-    if not d:
+    """Compact the M3 shortlist (names + status) plus leftover per-target hits.
+
+    Live openendo JSON stores human-readable names and M3 status/direction on
+    the top-level ``candidates`` list. ``per_target[].candidates`` often repeats
+    the same molecules with ``name`` equal to the ChEMBL id and no status —
+    that anonymous form is what caused CHEMBL413 (sirolimus, top-tier) to be
+    treated as an unlabeled / wrong-direction FKBP4 ligand.
+    """
+    payload = corpus.repurposing
+    if not payload:
         return "(no repurposing data)"
-    out = [f"pipeline: {d.get('pipeline')} · pchembl cutoff {d.get('pchembl_cutoff')}",
-           f"note: {d.get('note')}"]
-    for gene, entry in sorted(d.get("per_target", {}).items()):
-        cands = entry.get("candidates", [])
-        if cands:
-            names = ", ".join(f"{c.get('name') or c.get('molecule')} (pChEMBL {c.get('pchembl')}, phase {c.get('phase')})" for c in cands)
-            out.append(f"- {gene} ({entry.get('chembl')}): {names}")
+    out = [
+        f"pipeline: {payload.get('pipeline')} · pchembl cutoff {payload.get('pchembl_cutoff')}",
+        f"note: {payload.get('note')}",
+    ]
+    validation = payload.get("validation") if isinstance(payload.get("validation"), dict) else {}
+    vocab = validation.get("status_vocabulary") or []
+    if vocab:
+        out.append(f"M3 status vocabulary: {', '.join(vocab)}")
+    if validation.get("note"):
+        out.append(f"M3 note: {validation['note']}")
+
+    named = [c for c in (payload.get("candidates") or []) if isinstance(c, dict)]
+    named_mols = {c.get("molecule") for c in named if c.get("molecule")}
+    if named:
+        out.append(
+            "M3-validated shortlist (use these names + status; do not invent "
+            "or reverse direction when status is provided):"
+        )
+        for c in named:
+            out.append(_format_named_candidate(c))
+
+    leftovers = []
+    for gene, entry in sorted((payload.get("per_target") or {}).items()):
+        if not isinstance(entry, dict):
+            continue
+        extra = []
+        for c in entry.get("candidates") or []:
+            if not isinstance(c, dict):
+                continue
+            mol = c.get("molecule")
+            if mol and mol in named_mols:
+                continue
+            extra.append(c)
+        if extra:
+            labels = ", ".join(
+                f"{_display_name(c)} ({c.get('molecule')}, pChEMBL {c.get('pchembl')}, "
+                f"phase {c.get('phase')}, status={c.get('status') or 'unreviewed (ChEMBL screen only; not M3-validated)'})"
+                for c in extra
+            )
+            leftovers.append(f"- {gene} ({entry.get('chembl')}): {labels}")
+    if leftovers:
+        out.append(
+            "Additional per-target ChEMBL hits (not on the M3 shortlist; "
+            "no status/direction unless listed):"
+        )
+        out.extend(leftovers)
+    elif not named:
+        # Legacy fixtures / files with only per_target and no top-level names.
+        for gene, entry in sorted((payload.get("per_target") or {}).items()):
+            if not isinstance(entry, dict):
+                continue
+            cands = [c for c in (entry.get("candidates") or []) if isinstance(c, dict)]
+            if not cands:
+                continue
+            labels = ", ".join(
+                f"{_display_name(c)} ({c.get('molecule')}, pChEMBL {c.get('pchembl')}, "
+                f"phase {c.get('phase')}"
+                + (f", status={c.get('status')}" if c.get("status") else "")
+                + ")"
+                for c in cands
+            )
+            out.append(f"- {gene} ({entry.get('chembl')}): {labels}")
+
     return "\n".join(out) or "(no candidates)"
 
 
@@ -290,9 +400,55 @@ def compact_papers(corpus: Corpus, key: str = "evidence_weekly", limit: int = 12
     papers = dataset.get("papers", []) if isinstance(dataset, dict) else []
     if not isinstance(papers, list):
         papers = []
+    rows = papers[:limit]
+    if not rows:
+        return f"(no {key} papers)"
     out = []
-    for p in papers[:limit]:
+    any_abstract = False
+    for p in rows:
         title = p.get("title", "")
-        abstract = (p.get("abstract") or "")[:ABSTRACT_CHAR_CAP]
-        out.append(f"- PMID {p.get('pmid')} | {title} | {p.get('journal')} {p.get('pubdate')}\n  {abstract}")
-    return "\n\n".join(out) or f"(no {key} papers)"
+        abstract = (p.get("abstract") or "").strip()
+        if abstract:
+            any_abstract = True
+            abstract = abstract[:ABSTRACT_CHAR_CAP]
+            out.append(
+                f"- PMID {p.get('pmid')} | {title} | {p.get('journal')} {p.get('pubdate')}\n"
+                f"  {abstract}"
+            )
+        else:
+            out.append(
+                f"- PMID {p.get('pmid')} | {title} | {p.get('journal')} {p.get('pubdate')} "
+                f"[title only — no abstract]"
+            )
+    if not any_abstract:
+        return TITLE_ONLY_NOTE + "\n" + "\n".join(out)
+    return "\n\n".join(out)
+
+
+def pack_shared_context(corpus: Corpus) -> str:
+    """One packed context for the combined LLM call (targets, names, trials, titles)."""
+    return "\n\n".join(
+        [
+            "== TARGETS ==",
+            compact_targets(corpus),
+            "== REPURPOSING CANDIDATES ==",
+            compact_repurposing(corpus),
+            "== RECRUITING TRIALS WORLDWIDE ==",
+            compact_trials(corpus),
+            "== RECENT EVIDENCE (weekly digest; typically title-only) ==",
+            compact_papers(corpus, "evidence_weekly", limit=12),
+        ]
+    )
+
+
+def scoped_identifier_whitelist(corpus: Corpus, context: str) -> str:
+    """Whitelist IDs that actually appear in the packed prompt context.
+
+    Avoids resending hundreds of unused identifiers on every call.
+    """
+    out = []
+    for kind in ("pmid", "nct", "chembl"):
+        ids = sorted(i for i in corpus.allowed_ids.get(kind, ()) if i and i in context)
+        if ids:
+            out.append(f"{kind}: {', '.join(ids)}")
+    return "\n".join(out)

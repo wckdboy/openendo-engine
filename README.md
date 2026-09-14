@@ -9,8 +9,8 @@ layer.
 untested-hypothesis` and **traced to original sources** (PMID / NCT / ChEMBL /
 URL). Research support only — never individual medical advice.
 
-LangSmith-traced from day one: every LLM stage is visible as a trace with
-inputs, outputs, latency and cost.
+LangSmith-traced from day one: the combined LLM call is visible as a trace
+with inputs, outputs, latency and cost.
 
 ## Mission alignment
 
@@ -76,13 +76,23 @@ Required for a **live** run only. Dry-run needs none of these.
 | Var | Required for live run | Meaning |
 |---|---|---|
 | `OPENAI_API_KEY` | yes | key for the OpenAI-compatible endpoint |
-| `OPENAI_BASE_URL` | no (default OrcaRouter) | any OpenAI-compatible `/v1` endpoint |
-| `DISCOVERY_MODEL` | no | model name, default `deepseek/deepseek-v4-flash-0731` |
+| `OPENAI_BASE_URL` | no (default DeepSeek `https://api.deepseek.com`) | any OpenAI-compatible endpoint |
+| `DISCOVERY_MODEL` | no | model name, default `deepseek-flash` |
 | `LANGSMITH_API_KEY` | recommended | LangSmith API key (tracing; run continues without it) |
 | `LANGSMITH_ENDPOINT` | no | e.g. `https://eu.api.smith.langchain.com` (EU) |
 | `LANGSMITH_PROJECT` | no | tracing project, default `openendo-discovery-engine` |
 | `OPENENDO_SOURCE` | no | `raw` (default) or `local` |
 | `OPENENDO_PATH` | if source=`local` | local wckdboy/openendo checkout |
+
+The live default is **DeepSeek direct**. Any OpenAI-compatible provider works by
+setting `OPENAI_BASE_URL` + `DISCOVERY_MODEL` (OpenAI, OpenRouter, OrcaRouter,
+etc.). OrcaRouter is optional, not the default.
+
+A live run uses **one LLM call** for all four finding categories
+(`research_gap`, `conflict`, `repurposing_lead`, `hypothesis`), with shared
+corpus context packed once. Weekly evidence is title-only — prompts tell the
+model not to invent mechanisms from titles. ChEMBL `max_phase` is any-indication,
+not endometriosis-specific.
 
 ## Findings schema
 

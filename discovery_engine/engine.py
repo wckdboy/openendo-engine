@@ -1,7 +1,8 @@
-"""Discovery Engine core — the four Stage-4 passes.
+"""Discovery Engine core — one Stage-4 LLM call, four finding categories.
 
-Each pass is a @traceable function so the whole run shows up as a trace tree
-(root run -> stage runs -> per-call LLM runs) in LangSmith.
+The live path packs shared corpus context once (targets, named M3 shortlist,
+trials, title-only weekly evidence) and asks the model for all four categories
+in a single JSON object. Dry-run still skips the LLM.
 """
 from __future__ import annotations
 
@@ -30,28 +31,134 @@ Mission law — every output MUST obey all three:
 3. This is research support, never individual medical advice. No dosing,
    no patient-facing recommendations.
 
-Return STRICT JSON: a list of finding objects, each:
+Corpus caveats (do not overclaim):
+- Weekly evidence rows are titles only unless an abstract is present. Do not
+  invent mechanism, direction of effect, or study results from a title.
+- ChEMBL max_phase is the highest phase for ANY indication, not
+  endometriosis-specific. Do not treat it as endometriosis approval/trial status.
+- When a repurposing candidate has an M3 status in context (top-tier,
+  watchlist, validated-axis, wrong-direction), use that status. Do not relabel
+  a named shortlist compound as wrong-direction when its provided status is
+  top-tier or watchlist. wrong-direction and validated-axis are
+  target-validating evidence, not repurposing leads.
+
+Return STRICT JSON: one object with keys research_gap, conflict,
+repurposing_lead, hypothesis. Each value is a list of finding objects:
 {"claim": "...", "classification": "...", "confidence": "high|medium|low",
  "sources": [{"type": "pmid|nct|chembl|url", "id": "...", "url": "..."}],
  "rationale": "...", "caveats": "..."}
+Empty lists are allowed. Do not invent medical claims beyond the context.
 """
 
+STAGE_TASKS = {
+    "research_gap": (
+        "Identify concrete research gaps: novel targets with no approved drug, "
+        "no recruiting trial, or contradictory/absent expression evidence. "
+        "Name the gap, why it matters, and what evidence would close it. "
+        "Do not treat ChEMBL max_phase as endometriosis-specific."
+    ),
+    "conflict": (
+        "Find conflicting or contradictory results across the recent evidence "
+        "(e.g. direction-of-effect disagreements, mechanism disputes, results "
+        "that challenge a repurposing candidate's rationale). For each, state "
+        "the two sides with their sources and what would resolve the conflict. "
+        "If the evidence is title-only, do not invent the two sides from titles; "
+        "prefer an empty list over fabricated conflicts."
+    ),
+    "repurposing_lead": (
+        "Evaluate drug-repurposing leads using the named M3 shortlist. Rank "
+        "candidate drug->target pairs by the provided status, mechanistic "
+        "notes, and evidence already in context. Use provided drug names — "
+        "never discuss a shortlist compound as an anonymous ChEMBL id. Do not "
+        "flag wrong-direction unless the provided "
+        "status is wrong-direction. Suggest overlooked approved-drug "
+        "opportunities ONLY if supported by whitelisted targets/evidence."
+    ),
+    "hypothesis": (
+        "Generate testable, falsifiable research hypotheses linking targets, "
+        "mechanisms and disease biology. Each must name the proposed experiment "
+        "or analysis that would test it. Classification should almost always be "
+        "untested-hypothesis unless the cited sources directly support the claim. "
+        "Do not invent a mechanism from a paper title alone."
+    ),
+}
 
-def _extract_json(text: str) -> list:
-    """Tolerant JSON extraction (fenced or bare list)."""
+
+def _extract_json_value(text: str):
+    """Tolerant JSON extraction (fenced or bare object/list)."""
     text = text.strip()
     fence = re.search(r"```(?:json)?\s*(.*?)```", text, re.S)
     if fence:
         text = fence.group(1).strip()
-    start, end = text.find("["), text.rfind("]")
-    if start == -1 or end <= start:
-        raise ValueError(f"no JSON array in model output: {text[:200]}")
-    return json.loads(text[start : end + 1])
+    decoder = json.JSONDecoder()
+    for i, ch in enumerate(text):
+        if ch not in "[{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(text[i:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, (dict, list)):
+            return value
+    raise ValueError(f"no JSON object/array in model output: {text[:200]}")
+
+
+def group_stage_payload(payload) -> dict[str, list]:
+    """Split a combined model payload into the four finding categories."""
+    grouped = {category: [] for category in CATEGORIES}
+    if isinstance(payload, dict):
+        nested = payload.get("findings")
+        if isinstance(nested, list) and not any(
+            isinstance(payload.get(category), list) for category in CATEGORIES
+        ):
+            payload = nested
+        else:
+            for category in CATEGORIES:
+                items = payload.get(category)
+                if isinstance(items, list):
+                    grouped[category] = [item for item in items if isinstance(item, dict)]
+            return grouped
+    if isinstance(payload, list):
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            category = item.get("category")
+            if category in grouped:
+                grouped[category].append(item)
+        return grouped
+    raise ValueError(f"unexpected model payload type: {type(payload).__name__}")
+
+
+def _never_category(category: str) -> None:
+    """Exhaustiveness helper if CATEGORIES gains a member that STAGE_TASKS missed."""
+    raise ValueError(f"unhandled discovery category: {category}")
+
+
+def build_discovery_prompt(corpus: d.Corpus) -> str:
+    """Shared context + four category tasks in one user prompt."""
+    context = d.pack_shared_context(corpus)
+    whitelist = d.scoped_identifier_whitelist(corpus, context) or corpus.identifier_whitelist()
+    task_lines = []
+    for category in CATEGORIES:
+        task = STAGE_TASKS.get(category)
+        if task is None:
+            _never_category(category)
+        task_lines.append(f"- {category}: {task}")
+    return (
+        "Produce findings for ALL FOUR categories below from the same context. "
+        "Return a JSON object with those four keys (each a list of findings).\n\n"
+        + "\n".join(task_lines)
+        + "\n\nCONTEXT DATA (shared; sent once):\n"
+        + context
+        + "\n\nIDENTIFIER WHITELIST (only these may be cited; scoped to IDs in context):\n"
+        + (whitelist or "(none — do not cite pmid/nct/chembl identifiers)")
+        + "\n"
+    )
 
 
 @traceable(name="discovery_stage_call", run_type="chain")
-def _stage_call(client, model: str, temperature: float, category: str, user_prompt: str) -> list:
-    """One LLM stage call. Auto-traced by the wrapped client."""
+def _stage_call(client, model: str, temperature: float, user_prompt: str):
+    """One LLM call for all four categories. Auto-traced by the wrapped client."""
     resp = client.chat.completions.create(
         model=model,
         temperature=temperature,
@@ -61,38 +168,28 @@ def _stage_call(client, model: str, temperature: float, category: str, user_prom
         ],
     )
     content = resp.choices[0].message.content or ""
-    return _extract_json(content)
+    return _extract_json_value(content)
 
 
-def _run_stage(s, client, category: str, task: str, context: str, corpus: d.Corpus) -> dict:
-    """Validate + tag one stage's findings. Returns stage report."""
-    whitelist = corpus.identifier_whitelist()
-    prompt = (
-        f"TASK ({category}): {task}\n\n"
-        f"CONTEXT DATA:\n{context}\n\n"
-        f"IDENTIFIER WHITELIST (only these may be cited):\n{whitelist}\n\n"
-        "Return findings as a JSON array. Each finding must have a 'claim' that "
-        f"is a single {category.replace('_', ' ')}."
-    )
-    raw = _stage_call(client, s.model, s.temperature, category, prompt)
-
+def _validate_findings(raw: list, category: str, corpus: d.Corpus) -> dict:
+    """Validate + tag one category's findings. Returns stage report."""
     valid, dropped = [], []
-    for i, f in enumerate(raw):
-        f = dict(f)
-        f["category"] = category
-        problems = validate_finding(f, category, corpus.allowed_ids, i)
+    for i, finding in enumerate(raw):
+        finding = dict(finding)
+        finding["category"] = category
+        problems = validate_finding(finding, category, corpus.allowed_ids, i)
         if problems:
-            dropped.append({"finding": f, "problems": problems})
+            dropped.append({"finding": finding, "problems": problems})
             continue
-        f["sources"] = [
+        finding["sources"] = [
             {
                 "type": src.get("type"),
                 "id": str(src.get("id", "")),
                 "url": src.get("url") or _default_url(src.get("type"), src.get("id")),
             }
-            for src in f.get("sources") or []
+            for src in finding.get("sources") or []
         ]
-        valid.append(f)
+        valid.append(finding)
     return {"category": category, "findings": valid, "dropped": dropped}
 
 
@@ -150,74 +247,13 @@ def assemble_result(
     return result
 
 
-@traceable(name="discovery_research_gaps", run_type="chain")
-def stage_research_gaps(s, client, corpus: d.Corpus) -> dict:
-    ctx = "\n\n".join([
-        "== TARGETS (58 drug targets; 35 novel) ==",
-        d.compact_targets(corpus),
-        "== REPURPOSING CANDIDATES ==",
-        d.compact_repurposing(corpus),
-        "== RECRUITING TRIALS WORLDWIDE ==",
-        d.compact_trials(corpus),
-    ])
-    return _run_stage(
-        s, client, "research_gap",
-        "Identify concrete research gaps: novel targets with no approved drug, "
-        "no recruiting trial, or contradictory/absent expression evidence. "
-        "Name the gap, why it matters, and what evidence would close it.",
-        ctx, corpus,
-    )
-
-
-@traceable(name="discovery_conflicts", run_type="chain")
-def stage_conflicts(s, client, corpus: d.Corpus) -> dict:
-    ctx = d.compact_papers(corpus, "evidence_weekly", limit=12)
-    return _run_stage(
-        s, client, "conflict",
-        "Find conflicting or contradictory results across the recent evidence "
-        "(e.g. direction-of-effect disagreements, mechanism disputes, results "
-        "that challenge a repurposing candidate's rationale). For each, state "
-        "the two sides with their sources and what would resolve the conflict.",
-        ctx, corpus,
-    )
-
-
-@traceable(name="discovery_repurposing_leads", run_type="chain")
-def stage_repurposing_leads(s, client, corpus: d.Corpus) -> dict:
-    ctx = "\n\n".join([
-        "== REPURPOSING CANDIDATES ==",
-        d.compact_repurposing(corpus),
-        "== TARGETS ==",
-        d.compact_targets(corpus),
-        "== RECENT EVIDENCE ==",
-        d.compact_papers(corpus, "evidence_weekly", limit=8),
-    ])
-    return _run_stage(
-        s, client, "repurposing_lead",
-        "Evaluate drug-repurposing leads: rank candidate drug->target pairs by "
-        "mechanistic plausibility, evidence strength and direction of effect. "
-        "Flag wrong-direction candidates. Suggest overlooked approved-drug "
-        "opportunities ONLY if supported by whitelisted targets/evidence.",
-        ctx, corpus,
-    )
-
-
-@traceable(name="discovery_hypotheses", run_type="chain")
-def stage_hypotheses(s, client, corpus: d.Corpus) -> dict:
-    ctx = "\n\n".join([
-        "== TARGETS ==",
-        d.compact_targets(corpus),
-        "== RECENT EVIDENCE ==",
-        d.compact_papers(corpus, "evidence_weekly", limit=8),
-    ])
-    return _run_stage(
-        s, client, "hypothesis",
-        "Generate testable, falsifiable research hypotheses linking targets, "
-        "mechanisms and disease biology. Each must name the proposed experiment "
-        "or analysis that would test it. Classification should almost always be "
-        "untested-hypothesis unless the cited sources directly support the claim.",
-        ctx, corpus,
-    )
+@traceable(name="discovery_all_stages", run_type="chain")
+def run_all_stages(s, client, corpus: d.Corpus) -> list[dict]:
+    """One LLM call → four category reports (same schema as the old four stages)."""
+    prompt = build_discovery_prompt(corpus)
+    payload = _stage_call(client, s.model, s.temperature, prompt)
+    grouped = group_stage_payload(payload)
+    return [_validate_findings(grouped[category], category, corpus) for category in CATEGORIES]
 
 
 def _load_run_corpus(s: Settings, *, dry_run: bool) -> d.Corpus:
@@ -232,7 +268,7 @@ def _load_run_corpus(s: Settings, *, dry_run: bool) -> d.Corpus:
 
 @traceable(name="discovery_run", run_type="chain")
 def run_discovery(s: Settings, *, dry_run: bool = False) -> dict:
-    """Full engine run: four traced stages -> tagged findings report.
+    """Full engine run: one traced LLM call -> four tagged finding categories.
 
     dry_run skips the LLM and (for source=raw) remote fetches, then writes a
     schema-valid skeleton with empty findings. Local --source still loads
@@ -245,10 +281,5 @@ def run_discovery(s: Settings, *, dry_run: bool = False) -> dict:
         return assemble_result(s, empty_stage_reports(), warnings=warnings, dry_run=True)
 
     client = traced_client(s)
-    stage_reports = [
-        stage_research_gaps(s, client, corpus),
-        stage_conflicts(s, client, corpus),
-        stage_repurposing_leads(s, client, corpus),
-        stage_hypotheses(s, client, corpus),
-    ]
+    stage_reports = run_all_stages(s, client, corpus)
     return assemble_result(s, stage_reports, warnings=warnings, dry_run=False)
