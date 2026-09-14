@@ -5,12 +5,17 @@ from datetime import date
 
 from discovery_engine.config import CATEGORIES, ENGINE_VERSION, FINDINGS_SCHEMA, Settings
 from discovery_engine.engine import (
+    STAGE_TASKS,
+    SYSTEM_PROMPT,
+    _extract_json_value,
     assemble_result,
+    build_discovery_prompt,
     empty_stage_reports,
     gen_finding_id,
+    group_stage_payload,
     run_discovery,
 )
-from tests.helpers import write_mini_openendo
+from tests.helpers import mini_corpus, write_mini_openendo
 
 RESULT_KEYS = {
     "schema",
@@ -110,3 +115,60 @@ def test_dry_run_local_surfaces_latest_warning(tmp_path):
     assert result["source"] == "local"
     assert any("LATEST pointer missing" in w for w in result["warnings"])
     assert any("LLM stages skipped" in w for w in result["warnings"])
+
+
+def test_stage_tasks_cover_all_categories():
+    assert set(STAGE_TASKS) == set(CATEGORIES)
+
+
+def test_system_prompt_includes_corpus_caveats():
+    assert "titles only" in SYSTEM_PROMPT
+    assert "ANY indication" in SYSTEM_PROMPT
+    assert "M3 status" in SYSTEM_PROMPT
+    assert "one object with keys research_gap, conflict," in SYSTEM_PROMPT
+
+
+def test_build_discovery_prompt_packs_context_once():
+    corpus = mini_corpus()
+    prompt = build_discovery_prompt(corpus)
+    assert prompt.count("CONTEXT DATA (shared; sent once)") == 1
+    assert prompt.count("IDENTIFIER WHITELIST") == 1
+    for category in CATEGORIES:
+        assert f"- {category}:" in prompt
+    assert "Sirolimus (rapamycin)" in prompt
+    assert "status=top-tier" in prompt
+    assert "title-only" in prompt.lower()
+    assert "ChEMBL any-indication" in prompt
+    # Shared pack, not four copies of targets/repurposing.
+    assert prompt.count("== TARGETS ==") == 1
+    assert prompt.count("== REPURPOSING CANDIDATES ==") == 1
+
+
+def test_group_stage_payload_object_and_list():
+    payload = {
+        "research_gap": [{"claim": "gap"}],
+        "conflict": [],
+        "repurposing_lead": [{"claim": "lead"}],
+        "hypothesis": [{"claim": "hyp"}],
+    }
+    grouped = group_stage_payload(payload)
+    assert [f["claim"] for f in grouped["research_gap"]] == ["gap"]
+    assert grouped["conflict"] == []
+    assert grouped["repurposing_lead"][0]["claim"] == "lead"
+
+    as_list = [
+        {"category": "conflict", "claim": "c1"},
+        {"category": "hypothesis", "claim": "h1"},
+        {"category": "unknown", "claim": "drop-me"},
+    ]
+    grouped_list = group_stage_payload(as_list)
+    assert grouped_list["conflict"][0]["claim"] == "c1"
+    assert grouped_list["hypothesis"][0]["claim"] == "h1"
+    assert grouped_list["research_gap"] == []
+
+
+def test_extract_json_value_object_and_fence():
+    obj = _extract_json_value('```json\n{"research_gap": [], "conflict": []}\n```')
+    assert obj == {"research_gap": [], "conflict": []}
+    arr = _extract_json_value('prefix [{"claim": "x"}] suffix')
+    assert arr == [{"claim": "x"}]

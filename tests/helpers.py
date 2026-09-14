@@ -15,12 +15,34 @@ FIXTURE_TARGET = {
     "novel": True,
 }
 
-FIXTURE_CANDIDATE = {
-    "name": "fixture-molecule",
+# Mirrors live openendo JSON: per_target often stores name==molecule (anonymous
+# ChEMBL id), while the top-level candidates list has the human name + M3 status.
+FIXTURE_PER_TARGET_CANDIDATE = {
+    "name": "CHEMBL413",
     "molecule": "CHEMBL413",
     "pchembl": 8.1,
     "phase": 4,
 }
+
+FIXTURE_NAMED_CANDIDATE = {
+    "target": "FKBP4",
+    "target_chembl": "CHEMBL4050",
+    "molecule": "CHEMBL413",
+    "name": "Sirolimus (rapamycin)",
+    "pchembl": 8.1,
+    "phase": 4,
+    "status": "top-tier",
+    "status_detail": "Fixture M3 status — not a medical claim",
+    "validation_ref": "https://example.test/m3",
+}
+
+FIXTURE_VALIDATION = {
+    "status_vocabulary": ["top-tier", "watchlist", "validated-axis", "wrong-direction"],
+    "note": "synthetic fixture — status is not a medical claim",
+}
+
+# Back-compat alias used by per_target-only tests.
+FIXTURE_CANDIDATE = FIXTURE_PER_TARGET_CANDIDATE
 
 FIXTURE_TRIAL = {
     "nct_id": "NCT000001",
@@ -46,10 +68,12 @@ def mini_corpus() -> Corpus:
             "pipeline": "fixture",
             "pchembl_cutoff": 6.0,
             "note": "synthetic fixture — not a medical claim",
+            "validation": dict(FIXTURE_VALIDATION),
+            "candidates": [dict(FIXTURE_NAMED_CANDIDATE)],
             "per_target": {
                 "CHEMBL4050": {
                     "chembl": "CHEMBL4050",
-                    "candidates": [FIXTURE_CANDIDATE],
+                    "candidates": [dict(FIXTURE_PER_TARGET_CANDIDATE)],
                 }
             },
         },
@@ -85,8 +109,13 @@ def write_mini_openendo(
                 "pipeline": "fixture",
                 "pchembl_cutoff": 6.0,
                 "note": "synthetic fixture",
+                "validation": dict(FIXTURE_VALIDATION),
+                "candidates": [dict(FIXTURE_NAMED_CANDIDATE)],
                 "per_target": {
-                    "CHEMBL4050": {"chembl": "CHEMBL4050", "candidates": [FIXTURE_CANDIDATE]}
+                    "CHEMBL4050": {
+                        "chembl": "CHEMBL4050",
+                        "candidates": [dict(FIXTURE_PER_TARGET_CANDIDATE)],
+                    }
                 },
             },
         ),

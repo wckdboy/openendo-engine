@@ -7,6 +7,8 @@ import pytest
 
 from discovery_engine.data import (
     ABSTRACT_CHAR_CAP,
+    MAX_PHASE_NOTE,
+    TITLE_ONLY_NOTE,
     Corpus,
     CorpusLoadError,
     collect_whitelist,
@@ -15,6 +17,8 @@ from discovery_engine.data import (
     compact_targets,
     compact_trials,
     load_corpus,
+    pack_shared_context,
+    scoped_identifier_whitelist,
 )
 from tests.helpers import FIXTURE_PAPER, write_mini_openendo
 
@@ -28,12 +32,15 @@ def test_compact_targets_fixture(fixture_corpus):
     assert "FKBP4" in text
     assert "CHEMBL4050" in text
     assert "novel=True" in text
+    assert "ChEMBL any-indication" in text
+    assert MAX_PHASE_NOTE in text
 
 
 def test_compact_targets_respects_limit(fixture_corpus):
     fixture_corpus.targets["targets"] = fixture_corpus.targets["targets"] * 5
-    lines = [line for line in compact_targets(fixture_corpus, limit=2).splitlines() if line]
+    lines = [line for line in compact_targets(fixture_corpus, limit=2).splitlines() if line.startswith("- ")]
     assert len(lines) == 2
+    assert MAX_PHASE_NOTE in compact_targets(fixture_corpus, limit=2)
 
 
 def test_compact_repurposing_empty():
@@ -43,9 +50,126 @@ def test_compact_repurposing_empty():
 def test_compact_repurposing_fixture(fixture_corpus):
     text = compact_repurposing(fixture_corpus)
     assert "pipeline: fixture" in text
+    assert "Sirolimus (rapamycin)" in text
+    assert "CHEMBL413" in text
+    assert "status=top-tier" in text
+    assert "Fixture M3 status" in text
+    assert "M3 status vocabulary" in text
+    assert "top-tier" in text
+    assert "wrong-direction" in text
+    # Anonymous per_target duplicate is not emitted as a second unlabeled row.
+    assert "unreviewed" not in text
+
+
+def test_compact_repurposing_uses_shortlist_names_not_anonymous_ids():
+    """CHEMBL413 lives in per_target as name==id; shortlist has sirolimus + status."""
+    corpus = Corpus(
+        repurposing={
+            "pipeline": "fixture",
+            "pchembl_cutoff": 6.0,
+            "note": "synthetic",
+            "validation": {
+                "status_vocabulary": ["top-tier", "wrong-direction"],
+                "note": "fixture",
+            },
+            "candidates": [
+                {
+                    "target": "FKBP4",
+                    "target_chembl": "CHEMBL4050",
+                    "molecule": "CHEMBL413",
+                    "name": "Sirolimus (rapamycin)",
+                    "pchembl": 8.38,
+                    "phase": 4.0,
+                    "status": "top-tier",
+                    "status_detail": "Fixture TOP TIER — not a medical claim",
+                }
+            ],
+            "per_target": {
+                "FKBP4": {
+                    "chembl": "CHEMBL4050",
+                    "candidates": [
+                        {"molecule": "CHEMBL413", "name": "CHEMBL413", "pchembl": 8.38, "phase": 4.0},
+                    ],
+                }
+            },
+        }
+    )
+    text = compact_repurposing(corpus)
+    assert "Sirolimus (rapamycin)" in text
+    assert "CHEMBL413" in text
+    assert "status=top-tier" in text
+    assert "FKBP4" in text
+    # The compact line for the shortlist should not present the drug as name=CHEMBL413.
+    shortlist_line = [line for line in text.splitlines() if "CHEMBL413" in line and line.startswith("- ")][0]
+    assert "Sirolimus" in shortlist_line
+    assert "status=top-tier" in shortlist_line
+
+
+def test_compact_repurposing_per_target_only_keeps_names():
+    corpus = Corpus(
+        repurposing={
+            "pipeline": "fixture",
+            "pchembl_cutoff": 6.0,
+            "note": "legacy shape",
+            "per_target": {
+                "CHEMBL4050": {
+                    "chembl": "CHEMBL4050",
+                    "candidates": [
+                        {"name": "fixture-molecule", "molecule": "CHEMBL413", "pchembl": 8.1, "phase": 4},
+                    ],
+                }
+            },
+        }
+    )
+    text = compact_repurposing(corpus)
     assert "fixture-molecule" in text
+    assert "CHEMBL413" in text
     assert "pChEMBL 8.1" in text
-    assert "CHEMBL4050" in text
+
+
+def test_compact_repurposing_lists_unreviewed_leftovers():
+    corpus = Corpus(
+        repurposing={
+            "pipeline": "fixture",
+            "note": "synthetic",
+            "candidates": [
+                {
+                    "target": "FKBP4",
+                    "target_chembl": "CHEMBL4050",
+                    "molecule": "CHEMBL413",
+                    "name": "Sirolimus (rapamycin)",
+                    "pchembl": 8.1,
+                    "phase": 4,
+                    "status": "top-tier",
+                }
+            ],
+            "per_target": {
+                "FKBP4": {
+                    "chembl": "CHEMBL4050",
+                    "candidates": [
+                        {"molecule": "CHEMBL413", "name": "CHEMBL413", "pchembl": 8.1, "phase": 4},
+                        {"molecule": "CHEMBL999", "name": "CHEMBL999", "pchembl": 7.0, "phase": 4},
+                    ],
+                }
+            },
+        }
+    )
+    text = compact_repurposing(corpus)
+    assert "Sirolimus (rapamycin)" in text
+    assert "CHEMBL999" in text
+    assert "unreviewed (ChEMBL screen only; not M3-validated)" in text
+
+
+def test_collect_whitelist_includes_top_level_candidates():
+    corpus = Corpus(
+        repurposing={
+            "candidates": [
+                {"molecule": "CHEMBL413", "target_chembl": "CHEMBL4050"},
+            ]
+        }
+    )
+    collect_whitelist(corpus)
+    assert corpus.allowed_ids["chembl"] == {"CHEMBL413", "CHEMBL4050"}
 
 
 def test_compact_trials_empty():
@@ -87,6 +211,48 @@ def test_compact_papers_fixture_and_truncation(fixture_corpus):
     assert "Weekly fixture paper" in text
     assert long_abstract not in text
     assert ("x" * ABSTRACT_CHAR_CAP) in text
+    assert TITLE_ONLY_NOTE not in text
+
+
+def test_compact_papers_title_only_adds_caveat():
+    corpus = Corpus(
+        evidence_weekly={
+            "papers": [
+                {
+                    "pmid": "42722127",
+                    "title": "Fixture title-only weekly paper",
+                    "journal": "Fixture Journal",
+                    "pubdate": "2026",
+                }
+            ]
+        }
+    )
+    text = compact_papers(corpus, "evidence_weekly")
+    assert TITLE_ONLY_NOTE in text
+    assert "[title only — no abstract]" in text
+    assert "42722127" in text
+    assert "Prefer not inventing a mechanism from a title alone" in text
+
+
+def test_pack_shared_context_includes_blocks_once(fixture_corpus):
+    packed = pack_shared_context(fixture_corpus)
+    assert packed.count("== TARGETS ==") == 1
+    assert packed.count("== REPURPOSING CANDIDATES ==") == 1
+    assert packed.count("== RECRUITING TRIALS WORLDWIDE ==") == 1
+    assert packed.count("== RECENT EVIDENCE (weekly digest; typically title-only) ==") == 1
+    assert "Sirolimus (rapamycin)" in packed
+    assert MAX_PHASE_NOTE in packed
+
+
+def test_scoped_whitelist_only_ids_in_context(fixture_corpus):
+    context = pack_shared_context(fixture_corpus)
+    scoped = scoped_identifier_whitelist(fixture_corpus, context)
+    full = fixture_corpus.identifier_whitelist()
+    assert "CHEMBL413" in scoped
+    assert "CHEMBL4050" in scoped
+    assert "NCT000001" in scoped
+    assert "87654321" in scoped
+    assert len(scoped) <= len(full)
 
 
 def test_collect_whitelist_from_fixture(fixture_corpus):
